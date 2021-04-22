@@ -42,7 +42,41 @@ const EXTSIG_POSZIP         = 0x4690;
 
 const lget16 = (buf, off) => buf[off] | (buf[off+1] << 8);
 const lget32 = (buf, off) => (lget16(buf, off) | (lget16(buf, off+2) << 16)) & 0xffffffff;
-const lget64_bint = (buf, off) => BigInt(lget32(buf, off)) | (BigInt(lget32(buf, off+4)) << BigInt(32));
+
+const lget16_bint = (buf, off) => BigInt(buf[off]) | (BigInt(buf[off+1]) << 8n);
+const lget32_bint = (buf, off) => (lget16_bint(buf, off) | (lget16_bint(buf, off+2) << 16n)) & 0xffffffffn;
+const lget64_bint = (buf, off) => lget32_bint(buf, off) | (lget32_bint(buf, off+4) << 32n);
+const num32b = (bigint) => Number(bigint);
+const bint = (num) => BigInt(num);
+const BInt_max = (...entries) => {
+  if (entries.length === 0) {
+    return NaN;
+  }
+
+  let max = entries[0];
+  for (let entry of entries) {
+    if (entry > max) {
+      max = entry;
+    }
+  }
+
+  return max;
+}
+
+const BInt_min = (...entries) => {
+  if (entries.length === 0) {
+    return NaN;
+  }
+
+  let min = entries[0];
+  for (let entry of entries) {
+    if (entry < min) {
+      min = entry;
+    }
+  }
+
+  return min;
+}
 
 function arraycopy(src, srcPos, dest, destPos, len) {
   let srcTrunc = Math.max(0, src.length - srcPos);
@@ -111,31 +145,6 @@ function randomAccessFile(filepath) {
   }
 }
 
-function consolidate_EOCD_ZIP64(eocd__64) {
-  let eocd_64 = eocd__64, eocd = eocd__64;
-  let isZip64 = false;
-  return {
-    isZip64,
-
-    sig:                  isZip64 ? eocd_64.zip64_sig : eocd.sig,
-    num_disk:             isZip64 ? eocd_64.zip64_num_disk : eocd.num_disk,
-    num_disk_cd:          isZip64 ? eocd_64.zip64_num_disk_cd : eocd.num_disk_cd,
-    num_disk_entries_cd:  isZip64 ? eocd_64.zip64_num_disk_entries_cd : eocd.num_disk_entries_cd,
-    num_entries_cd:       isZip64 ? eocd_64.zip64_num_entries_cd : eocd.num_entries_cd,
-    sz_cd:                isZip64 ? eocd_64.zip64_sz_cd : eocd.sz_cd,
-    off_disk_cd:          isZip64 ? eocd_64.zip64_off_disk_cd : eocd.off_disk_cd,
-
-    // zip only (no zip64)
-    len_comment:          eocd.len_comment,
-    comment:              eocd.comment,
-
-    // zip64 only
-    ver:                  eocd_64.ver,
-    ver_ext:              eocd_64.ver_ext,
-    ext:                  eocd_64.ext
-  };
-}
-
 function EOCD(buf, off) {
   let eocd = {
     sig:                  lget32(buf, off),
@@ -143,39 +152,56 @@ function EOCD(buf, off) {
     num_disk_cd:          lget16(buf, off+6),
     num_disk_entries_cd:  lget16(buf, off+8),
     num_entries_cd:       lget16(buf, off+10),
-    sz_cd:                lget32(buf, off+12),
-    off_disk_cd:          lget32(buf, off+16),
+    sz_cd:                lget32_bint(buf, off+12),
+    off_disk_cd:          lget32_bint(buf, off+16),
     len_comment:          lget16(buf, off+20),
-    comment:              null
+
+    // set below
+    comment:              null,
+    is_zip_64:            false
   };
 
-  let commentBuf = getbuf(eocd.len_comment);
-  arraycopy(buf, off+22, commentBuf, 0, commentBuf.length);
-  eocd.comment = uint8arr_to_str(commentBuf);
+  eocd.comment = cp_buf_str(buf, off+22, eocd.len_comment);
+  eocd.is_zip_64 = eocd.num_disk === 0xffff
+    || eocd.num_disk_cd === 0xffff
+    || eocd.num_disk_entries_cd === 0xffff
+    || eocd.sz_cd === 0xffffffffn
+    || eocd.off_disk_cd === 0xffffffffn;
 
-  return consolidate_EOCD_ZIP64(eocd);
+  return eocd;
 }
 
 function EOCD_64(buf, off, eocd) {
   let eocd_64 = {
     ...eocd,
 
-    zip64_sig:                  lget32(buf, off),
-    sz_eocd64:                  lget64_bint(buf, off+4),
-    ver:                        lget16(buf, off+12),
-    ver_ext:                    lget16(buf, off+14),
-    zip64_num_disk:             lget32(buf, off+16),
-    zip64_num_disk_cd:          lget32(buf, off+20),
-    zip64_num_disk_entries_cd:  lget64_bint(buf, off+24),
-    zip64_num_entries_cd:       lget64_bint(buf, off+32),
-    zip64_sz_cd:                lget64_bint(buf, off+40),
-    zip64_off_disk_cd:          lget64_bint(buf, off+48),
-    zip64_ext:                  null
+    zip64_sig:            lget32(buf, off),
+    sz_eocd64:            lget64_bint(buf, off+4),
+
+    // zip64 only
+    ver:                  lget16(buf, off+12),
+    ver_ext:              lget16(buf, off+14),
+
+    // merge with zip eocd
+    num_disk:             lget32_bint(buf, off+16),
+    num_disk_cd:          lget32_bint(buf, off+20),
+    num_disk_entries_cd:  lget64_bint(buf, off+24),
+    num_entries_cd:       lget64_bint(buf, off+32),
+    sz_cd:                lget64_bint(buf, off+40),
+    off_disk_cd:          lget64_bint(buf, off+48),
+
+    // zip6 only
+    zip64_ext:            null
   };
 
-  eocd_64.zip64_ext = cp_buf(buf, off+56, eocd_64.sz_eocd64 - 44 /* sizeof non-ext EOCD */);
+  if (eocd_64.sz_eocd64 < bint(Number.MAX_SAFE_INTEGER)) {
+    // 44 = sizeof non-ext EOCD
+    eocd_64.zip64_ext = cp_buf(buf, off+56, num32b(eocd_64.sz_eocd64) - 44);
+  } else {
+    eocd_64.zip64_ext = 'EOCD_64 EXT TOO LARGE';
+  }
 
-  return consolidate_EOCD_ZIP64(eocd_64);
+  return eocd_64;
 }
 
 function CDIR(buf, off) {
@@ -187,15 +213,16 @@ function CDIR(buf, off) {
     compression:    lget16(buf, off+10),
     tm_last_mod:    lget16(buf, off+12),
     dt_last_mod:    lget16(buf, off+14),
-    crc_32:         lget32(buf, off+16),
-    sz_compress:    lget32(buf, off+20),
-    sz_uncompress:  lget32(buf, off+24),
+    crc_32:         lget32_bint(buf, off+16),
+    sz_compress:    lget32_bint(buf, off+20),
+    sz_uncompress:  lget32_bint(buf, off+24),
     len_filename:   lget16(buf, off+28),
     len_ext:        lget16(buf, off+30),
     len_comment:    lget16(buf, off+34),
     num_disk:       lget16(buf, off+34),
     attrs_int:      lget16(buf, off+36),
-    off_loc:        lget32(buf, off+38),
+    attrs_ext:      lget32_bint(buf, off+38),
+    off_loc:        lget32_bint(buf, off+42),
 
     // set below
     sz_cdir:        0,
@@ -255,6 +282,8 @@ function CDIR(buf, off) {
         case EXTSIG_POSZIP:
         default:
       }
+
+      _ext_off += (4 + sz_data);
     }
   }
 
@@ -385,7 +414,7 @@ exports.eocd = (zipFile = '') => {
         offset = rb.length();
 
         eocd = EOCD(rb.getBuffer(), 0);
-        isZip64 = eocd.isZip64;
+        isZip64 = eocd.is_zip_64;
         if (!isZip64) {
           isFound = true;
         }
@@ -402,7 +431,7 @@ exports.eocd = (zipFile = '') => {
     throw new Error("EOCD Not Found");
   }
 
-  if (eocd.num_disk !== 0 || eocd.num_disk_cd !== 0) {
+  if (eocd.num_disk !== 0n || eocd.num_disk_cd !== 0n) {
     throw new Error("Multiple disks");
   }
 
@@ -425,9 +454,11 @@ exports.eocd = (zipFile = '') => {
   let buf_2mb = getbuf(SZ_MB_2);
   while (offset > cdStartOff) {
     let bytesLeft = offset - cdStartOff;
-    let readsz = Math.min(bytesLeft, buf_2mb.byteLength);
-    let len = sb.head(buf_2mb, offset-readsz, readsz);
-    offset -= len;
+    let readsz = num32b(BInt_min(bytesLeft, bint(buf_2mb.byteLength)));
+    let head_offset = num32b(offset - bint(readsz));
+    let len = sb.head(buf_2mb, head_offset, readsz);
+
+    offset -= bint(len);
     if (len === -1) {
       throw new Error("EOF")
     }
@@ -462,7 +493,7 @@ exports.eocd = (zipFile = '') => {
 
   // final sanity check
   let expected = eocd.num_entries_cd;
-  let actual = cdirList.length;
+  let actual = bint(cdirList.length);
   if (expected !== actual) {
     throw new Error(`Expected ${expected} CDIR records, got ${actual}`);
   }
