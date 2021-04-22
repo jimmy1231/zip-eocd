@@ -335,7 +335,7 @@ function resizableBuffer() {
   }
 }
 
-exports.eocd = (zipFile = '') => {
+exports.zipEOCD = (zipFile = '') => {
   let sb = randomAccessFile(zipFile);
   let rb = resizableBuffer();
 
