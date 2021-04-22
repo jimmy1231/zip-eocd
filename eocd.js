@@ -10,6 +10,24 @@ const SIG_EOCD_64 = 0x06064b50;
 const SIG_EOCD = 0x06054b50;
 const SIG_CDIR = 0x02014b50;
 
+
+const lget16 = (buf, off) => buf[off] | (buf[off+1] << 8);
+const lget32 = (buf, off) => (lget16(buf, off) | (lget16(buf, off+2) << 16)) & 0xffffffff;
+const lget64_bint = (buf, off) => BigInt(lget32(buf, off)) | (BigInt(lget32(buf, off+4)) << BigInt(32));
+
+function arraycopy(src, srcPos, dest, destPos, len) {
+  let srcTrunc = Math.max(0, src.length - srcPos);
+  let destTrunc = Math.max(0, dest.length - destPos);
+  let lim = Math.min(len, srcTrunc, destTrunc);
+  for (let i=0; i<lim; i++) {
+    dest[destPos+i] = src[srcPos+i];
+  }
+}
+
+function uint8ArrToStr(uint8Arr) {
+  return Buffer.from(uint8Arr).toString('utf-8');
+}
+
 function toRandomAccessBuffer(obj) {
   return {
     head: async (buf, off, len) => 0,
@@ -17,34 +35,72 @@ function toRandomAccessBuffer(obj) {
   }
 }
 
-function consolidate_EOCD_ZIP64(eocd, eocd_64) {
+function consolidate_EOCD_ZIP64(eocd__64) {
+  let eocd_64 = eocd__64, eocd = eocd__64;
+  let isZip64 = false;
   return {
     isZip64: () => false,
-    sig: '',
-    num_disk: '',
-    num_disk_cd: '',
-    num_disk_entries_cd: '',
-    num_entries_cd: '',
-    sz_cd: '',
-    off_disk_cd: '',
-    len_comment: '',
-    comment: '',
+    sig:                  isZip64 ? eocd_64.zip64_sig : eocd.sig,
+    num_disk:             isZip64 ? eocd_64.zip64_num_disk : eocd.num_disk,
+    num_disk_cd:          isZip64 ? eocd_64.zip64_num_disk_cd : eocd.num_disk_cd,
+    num_disk_entries_cd:  isZip64 ? eocd_64.zip64_num_disk_entries_cd : eocd.num_disk_entries_cd,
+    num_entries_cd:       isZip64 ? eocd_64.zip64_num_entries_cd : eocd.num_entries_cd,
+    sz_cd:                isZip64 ? eocd_64.zip64_sz_cd : eocd.sz_cd,
+    off_disk_cd:          isZip64 ? eocd_64.zip64_off_disk_cd : eocd.off_disk_cd,
 
-    // zip64
-    ver: '',
-    ver_ext: ''
+    // zip only (no zip64)
+    len_comment:          eocd.len_comment,
+    comment:              eocd.comment,
+
+    // zip64 only
+    ver:                  eocd_64.ver,
+    ver_ext:              eocd_64.ver_ext,
+    ext:                  eocd_64.ext
   };
 }
 
 function EOCD(buf, off) {
-  return consolidate_EOCD_ZIP64({
-  }, null);
+  let eocd = {
+    sig:                  lget32(buf, off),
+    num_disk:             lget16(buf, off+4),
+    num_disk_cd:          lget16(buf, off+6),
+    num_disk_entries_cd:  lget16(buf, off+8),
+    num_entries_cd:       lget16(buf, off+10),
+    sz_cd:                lget32(buf, off+12),
+    off_disk_cd:          lget32(buf, off+16),
+    len_comment:          lget16(buf, off+20),
+    comment:              null
+  };
+
+  let commentBuf = get_buf(eocd.len_comment);
+  arraycopy(buf, off+22, commentBuf, 0, commentBuf.length);
+  eocd.comment = uint8ArrToStr(commentBuf);
+
+  return consolidate_EOCD_ZIP64(eocd);
 }
 
 function EOCD_64(buf, off, eocd) {
-  return consolidate_EOCD_ZIP64(null, {
+  let eocd_64 = {
+    ...eocd,
 
-  });
+    zip64_sig:                  lget32(buf, off),
+    sz_eocd64:                  lget64_bint(buf, off+4),
+    ver:                        lget16(buf, off+12),
+    ver_ext:                    lget16(buf, off+14),
+    zip64_num_disk:             lget32(buf, off+16),
+    zip64_num_disk_cd:          lget32(buf, off+20),
+    zip64_num_disk_entries_cd:  lget64_bint(buf, off+24),
+    zip64_num_entries_cd:       lget64_bint(buf, off+32),
+    zip64_sz_cd:                lget64_bint(buf, off+40),
+    zip64_off_disk_cd:          lget64_bint(buf, off+48),
+    zip64_ext:                  null
+  };
+
+  let extBuf = get_buf(eocd_64.sz_eocd64 - 44 /* sizeof non-ext EOCD */);
+  arraycopy(buf, off+56, extBuf, 0, extBuf.length);
+  eocd_64.zip64_ext = extBuf;
+
+  return consolidate_EOCD_ZIP64(eocd_64);
 }
 
 function CDIR(buf, off) {
@@ -73,21 +129,52 @@ function CDIR(buf, off) {
 }
 
 function resizableBuffer() {
-  let buf = null;
+  let buf = new Uint8Array(0);
+
+  const resize = (newLen, origOff, newOff, len) => {
+    let tmp = new Uint8Array(newLen);
+    let lenToCopy = len < 0 ? buf.length : Math.min(buf.length, len);
+
+    if ((newLen - newOff + lenToCopy) > newLen) {
+      lenToCopy = Math.max(newLen - newOff, 0);
+    }
+
+    arraycopy(buf, origOff, tmp, newOff, lenToCopy);
+    buf = tmp;
+  };
+
   return {
-    coalesce_front: (buf, off, len) => {},
-    resize: (newLen, origOff, newOff, len) => {},
-    ensureSize: (size) => {},
+    coalesce_front: (_buf, off, len) => {
+      if (len === 0) {
+        return;
+      }
+
+      /*
+       * (1) Resize buf to accommodate size of _buf
+       * (2) Exactly copy contents of _buf into front of buf
+       *     such that _buf and the old buf are concatenated
+       *     without "empty" bytes in between
+       */
+      resize(buf.length + len, 0, len, -1);
+      arraycopy(_buf, off, buf, 0, len);
+    },
+    resize,
+    ensureSize: (size) => {
+      if (buf.length <= size) {
+        return;
+      }
+
+      resize(size, 0, 0, size);
+    },
     getBuffer: () => buf,
-    length: () => 0,
-    lget16: (off) => 0,
-    lget32: (off) => 0,
-    lget64: (off) => 0
+    length: () => buf.byteLength,
+    lget16: (off) => lget16(buf, off),
+    lget32: (off) => lget32(buf, off)
   }
 }
 
 // helper function to initialize buffer of size
-function buf(size) {
+function get_buf(size) {
   return new Uint8Array(size);
 }
 
@@ -98,7 +185,7 @@ exports.eocd = async ({ zipFile = '' }) => {
   let eocd = null;
 
   let isFound = false;
-  let buf_64 = buf(64);
+  let buf_64 = get_buf(64);
   let offset = 0;
   let isZip64 = false;
   while (!isFound && offset < SZ_MB_4) {
@@ -207,7 +294,7 @@ exports.eocd = async ({ zipFile = '' }) => {
   const cdStartOff = eocd.off_disk_cd;
   const cdEndOff = eocd.off_disk_cd + eocd.sz_cd;
   offset = cdEndOff;
-  let buf_2mb = buf(SZ_MB_2);
+  let buf_2mb = get_buf(SZ_MB_2);
   while (offset > cdStartOff) {
     let bytesLeft = offset - cdStartOff;
     let readsz = Math.min(bytesLeft, buf_2mb.byteLength);
