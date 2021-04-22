@@ -39,6 +39,7 @@ const EXTSIG_IBM_UNCOMPRESS = 0x0065;
 const EXTSIG_IBM_COMPRESS   = 0x0066;
 const EXTSIG_POSZIP         = 0x4690;
 
+
 const lget16 = (buf, off) => buf[off] | (buf[off+1] << 8);
 const lget32 = (buf, off) => (lget16(buf, off) | (lget16(buf, off+2) << 16)) & 0xffffffff;
 const lget64_bint = (buf, off) => BigInt(lget32(buf, off)) | (BigInt(lget32(buf, off+4)) << BigInt(32));
@@ -59,16 +60,26 @@ function uint8arr_to_str(uint8Arr) {
 function getbuf(size) {
   return new Uint8Array(size);
 }
+
+function cp_buf(buf, off, size) {
+  let _buf = getbuf(size);
+  arraycopy(buf, off, _buf, 0, _buf.length);
+  return _buf;
+}
+
+function cp_buf_str(buf, off, size) {
+  return uint8arr_to_str(cp_buf(buf, off, size));
+}
 ///////////////////////////////////////
 
 
-function toRandomAccessBuffer(filepath) {
+function randomAccessFile(filepath) {
   filepath = path.resolve(filepath);
   let fd = fs.openSync(filepath, 'r', 0o666);
   let {size: filesize} = fs.statSync(filepath);
 
   return {
-    head: async (buf, off, len) => {
+    head: (buf, off, len) => {
       try {
         if (off > filesize || off < 0 || len < 0) {
           return -1;
@@ -80,7 +91,7 @@ function toRandomAccessBuffer(filepath) {
         return -1
       }
     },
-    tail: async (buf, off, len) => {
+    tail: (buf, off, len) => {
       try {
         if (off > filesize || off < 0 || len < 0) {
           return -1;
@@ -104,7 +115,8 @@ function consolidate_EOCD_ZIP64(eocd__64) {
   let eocd_64 = eocd__64, eocd = eocd__64;
   let isZip64 = false;
   return {
-    isZip64: () => false,
+    isZip64,
+
     sig:                  isZip64 ? eocd_64.zip64_sig : eocd.sig,
     num_disk:             isZip64 ? eocd_64.zip64_num_disk : eocd.num_disk,
     num_disk_cd:          isZip64 ? eocd_64.zip64_num_disk_cd : eocd.num_disk_cd,
@@ -161,9 +173,7 @@ function EOCD_64(buf, off, eocd) {
     zip64_ext:                  null
   };
 
-  let extBuf = getbuf(eocd_64.sz_eocd64 - 44 /* sizeof non-ext EOCD */);
-  arraycopy(buf, off+56, extBuf, 0, extBuf.length);
-  eocd_64.zip64_ext = extBuf;
+  eocd_64.zip64_ext = cp_buf(buf, off+56, eocd_64.sz_eocd64 - 44 /* sizeof non-ext EOCD */);
 
   return consolidate_EOCD_ZIP64(eocd_64);
 }
@@ -188,20 +198,14 @@ function CDIR(buf, off) {
     off_loc:        lget32(buf, off+38),
 
     // set below
-    size:           0,
+    sz_cdir:        0,
     filename:       null,
     comment:        null
   };
 
-  let filenameBuf = getbuf(cdir.len_filename);
-  arraycopy(buf, off+46, filenameBuf, 0, filenameBuf.length);
-  cdir.filename = uint8arr_to_str(filenameBuf);
-
-  let commentBuf = getbuf(cdir.len_comment);
-  arraycopy(buf, off+46+cdir.len_filename+cdir.len_ext, commentBuf, 0, commentBuf.length);
-  cdir.comment = uint8arr_to_str(commentBuf);
-
-  cdir.size = 46 + cdir.len_filename + cdir.len_ext + cdir.len_comment
+  cdir.filename = cp_buf_str(buf, off+46, cdir.len_filename);
+  cdir.comment = cp_buf_str(buf, off+46+cdir.len_filename+cdir.len_ext, cdir.len_comment);
+  cdir.sz_cdir = 46 + cdir.len_filename + cdir.len_ext + cdir.len_comment
 
   if (cdir.len_ext > 0) {
     let ext_off = off+46+cdir.len_filename;
@@ -302,8 +306,8 @@ function resizableBuffer() {
   }
 }
 
-exports.eocd = async ({ zipFile = '' }) => {
-  let sb = toRandomAccessBuffer(zipFile);
+exports.eocd = (zipFile = '') => {
+  let sb = randomAccessFile(zipFile);
   let rb = resizableBuffer();
 
   let eocd = null;
@@ -313,7 +317,7 @@ exports.eocd = async ({ zipFile = '' }) => {
   let offset = 0;
   let isZip64 = false;
   while (!isFound && offset < SZ_MB_4) {
-    let len = await sb.tail(buf_64, offset, buf_64.byteLength);
+    let len = sb.tail(buf_64, offset, buf_64.byteLength);
     offset += len;
     if (len === -1) {
       throw new Error("EOF");
@@ -381,7 +385,7 @@ exports.eocd = async ({ zipFile = '' }) => {
         offset = rb.length();
 
         eocd = EOCD(rb.getBuffer(), 0);
-        isZip64 = eocd.isZip64();
+        isZip64 = eocd.isZip64;
         if (!isZip64) {
           isFound = true;
         }
@@ -422,7 +426,7 @@ exports.eocd = async ({ zipFile = '' }) => {
   while (offset > cdStartOff) {
     let bytesLeft = offset - cdStartOff;
     let readsz = Math.min(bytesLeft, buf_2mb.byteLength);
-    let len = await sb.head(buf_2mb, offset-readsz, readsz);
+    let len = sb.head(buf_2mb, offset-readsz, readsz);
     offset -= len;
     if (len === -1) {
       throw new Error("EOF")
@@ -438,7 +442,7 @@ exports.eocd = async ({ zipFile = '' }) => {
           cdirList.unshift(cdir);
 
           // Skip over read bytes, "-1" accounts for loop increment
-          i += (cdir.size() - 1);
+          i += (cdir.sz_cdir - 1);
         } catch (err) {
           // swallow
           console.error(err);
