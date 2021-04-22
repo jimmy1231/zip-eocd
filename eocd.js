@@ -4,12 +4,40 @@
  * https://pkware.cachefly.net/webdocs/casestudies/APPNOTE.TXT
  */
 
-const SZ_MB_4 = 4 * 1024 * 1024;
-const SZ_MB_2 = 2 * 1024 * 1024;
-const SIG_EOCD_64 = 0x06064b50;
-const SIG_EOCD = 0x06054b50;
-const SIG_CDIR = 0x02014b50;
+const fs = require("fs");
+const path = require("path");
 
+
+///////////////////////////////////////
+const SZ_MB_4               = 4 * 1024 * 1024;
+const SZ_MB_2               = 2 * 1024 * 1024;
+
+const SIG_EOCD_64           = 0x06064b50;
+const SIG_EOCD              = 0x06054b50;
+const SIG_CDIR              = 0x02014b50;
+
+const EXTSIG_ZIP64          = 0x0001;
+const EXTSIG_AV             = 0x0007;
+const EXTSIG_PFS            = 0x0008;
+const EXTSIG_OS2            = 0x0009;
+const EXTSIG_NTFS           = 0x000a;
+const EXTSIG_OPENVMS        = 0x000c;
+const EXTSIG_UNIX           = 0x000d;
+const EXTSIG_STREAM         = 0x000e;
+const EXTSIG_PATCH          = 0x000f;
+const EXTSIG_X509_PKCS      = 0x0014;
+const EXTSIG_X509_LOC       = 0x0015;
+const EXTSIG_X509_CEN       = 0x0016;
+const EXTSIG_CRYPT          = 0x0017;
+const EXTSIG_RMC            = 0x0018;
+const EXTSIG_CERT_LIST_PKCS = 0x0019;
+const EXTSIG_TIMESTAMP      = 0x0020;
+const EXTSIG_DECRYPT        = 0x0021;
+const EXTSIG_SCRYPT_KEY     = 0x0022;
+const EXTSIG_SCRYPT_DATA    = 0x0023;
+const EXTSIG_IBM_UNCOMPRESS = 0x0065;
+const EXTSIG_IBM_COMPRESS   = 0x0066;
+const EXTSIG_POSZIP         = 0x4690;
 
 const lget16 = (buf, off) => buf[off] | (buf[off+1] << 8);
 const lget32 = (buf, off) => (lget16(buf, off) | (lget16(buf, off+2) << 16)) & 0xffffffff;
@@ -24,14 +52,51 @@ function arraycopy(src, srcPos, dest, destPos, len) {
   }
 }
 
-function uint8ArrToStr(uint8Arr) {
+function uint8arr_to_str(uint8Arr) {
   return Buffer.from(uint8Arr).toString('utf-8');
 }
 
-function toRandomAccessBuffer(obj) {
+function getbuf(size) {
+  return new Uint8Array(size);
+}
+///////////////////////////////////////
+
+
+function toRandomAccessBuffer(filepath) {
+  filepath = path.resolve(filepath);
+  let fd = fs.openSync(filepath, 'r', 0o666);
+  let {size: filesize} = fs.statSync(filepath);
+
   return {
-    head: async (buf, off, len) => 0,
-    tail: async (buf, off, len) => 0
+    head: async (buf, off, len) => {
+      try {
+        if (off > filesize || off < 0 || len < 0) {
+          return -1;
+        }
+
+        len = Math.min(filesize, off+len) - off;
+        return fs.readSync(fd, buf, 0, len, off);
+      } catch (err) {
+        return -1
+      }
+    },
+    tail: async (buf, off, len) => {
+      try {
+        if (off > filesize || off < 0 || len < 0) {
+          return -1;
+        }
+
+        let end = filesize - off;
+        off = Math.max(end - len, 0);
+        len = end - off;
+        return fs.readSync(fd, buf, 0, len, off);
+      } catch (err) {
+        return -1;
+      }
+    },
+    close: () => {
+      fs.closeSync(fd);
+    }
   }
 }
 
@@ -72,9 +137,9 @@ function EOCD(buf, off) {
     comment:              null
   };
 
-  let commentBuf = get_buf(eocd.len_comment);
+  let commentBuf = getbuf(eocd.len_comment);
   arraycopy(buf, off+22, commentBuf, 0, commentBuf.length);
-  eocd.comment = uint8ArrToStr(commentBuf);
+  eocd.comment = uint8arr_to_str(commentBuf);
 
   return consolidate_EOCD_ZIP64(eocd);
 }
@@ -96,7 +161,7 @@ function EOCD_64(buf, off, eocd) {
     zip64_ext:                  null
   };
 
-  let extBuf = get_buf(eocd_64.sz_eocd64 - 44 /* sizeof non-ext EOCD */);
+  let extBuf = getbuf(eocd_64.sz_eocd64 - 44 /* sizeof non-ext EOCD */);
   arraycopy(buf, off+56, extBuf, 0, extBuf.length);
   eocd_64.zip64_ext = extBuf;
 
@@ -104,28 +169,92 @@ function EOCD_64(buf, off, eocd) {
 }
 
 function CDIR(buf, off) {
-  return {
-    size: () => 0,
-    sig: '',
-    ver: '',
-    ver_ext: '',
-    flg_gen: '',
-    compression: '',
-    tm_last_mod: '',
-    dt_last_mod: '',
-    crc_32: '',
-    sz_compress: '',
-    sz_uncompress: '',
-    len_filename: '',
-    len_ext: '',
-    len_comment: '',
-    num_disk: '',
-    attrs_int: '',
-    off_loc: '',
-    filename: '',
-    ext: {},
-    comment: ''
+  let cdir = {
+    sig:            lget32(buf, off),
+    ver:            lget16(buf, off+4),
+    ver_ext:        lget16(buf, off+6),
+    flg_gen:        lget16(buf, off+8),
+    compression:    lget16(buf, off+10),
+    tm_last_mod:    lget16(buf, off+12),
+    dt_last_mod:    lget16(buf, off+14),
+    crc_32:         lget32(buf, off+16),
+    sz_compress:    lget32(buf, off+20),
+    sz_uncompress:  lget32(buf, off+24),
+    len_filename:   lget16(buf, off+28),
+    len_ext:        lget16(buf, off+30),
+    len_comment:    lget16(buf, off+34),
+    num_disk:       lget16(buf, off+34),
+    attrs_int:      lget16(buf, off+36),
+    off_loc:        lget32(buf, off+38),
+
+    // set below
+    size:           0,
+    filename:       null,
+    comment:        null
   };
+
+  let filenameBuf = getbuf(cdir.len_filename);
+  arraycopy(buf, off+46, filenameBuf, 0, filenameBuf.length);
+  cdir.filename = uint8arr_to_str(filenameBuf);
+
+  let commentBuf = getbuf(cdir.len_comment);
+  arraycopy(buf, off+46+cdir.len_filename+cdir.len_ext, commentBuf, 0, commentBuf.length);
+  cdir.comment = uint8arr_to_str(commentBuf);
+
+  cdir.size = 46 + cdir.len_filename + cdir.len_ext + cdir.len_comment
+
+  if (cdir.len_ext > 0) {
+    let ext_off = off+46+cdir.len_filename;
+    let ext_len = cdir.len_ext + 4;
+
+    let id_hdr, sz_data;
+    let _ext_off = ext_off;
+    const lim = ext_off + ext_len;
+    while (_ext_off < lim) {
+      id_hdr = lget16(buf, _ext_off);
+      sz_data = lget16(buf, _ext_off+2);
+
+      switch (id_hdr) {
+        case EXTSIG_ZIP64:
+          if (sz_data === 24 || sz_data === 28) {
+            cdir = {
+              ...cdir,
+
+              sz_uncompress:  lget64_bint(buf, _ext_off+4),
+              sz_compress:    lget64_bint(buf, _ext_off+12),
+              off_loc:        lget64_bint(buf, _ext_off+20),
+              num_disk:       sz_data === 28 ? lget64_bint(buf, off+28) : cdir.num_disk
+            };
+          }
+          break;
+
+        case EXTSIG_AV:
+        case EXTSIG_PFS:
+        case EXTSIG_OS2:
+        case EXTSIG_NTFS:
+        case EXTSIG_OPENVMS:
+        case EXTSIG_UNIX:
+        case EXTSIG_STREAM:
+        case EXTSIG_PATCH:
+        case EXTSIG_X509_PKCS:
+        case EXTSIG_X509_LOC:
+        case EXTSIG_X509_CEN:
+        case EXTSIG_CRYPT:
+        case EXTSIG_RMC:
+        case EXTSIG_CERT_LIST_PKCS:
+        case EXTSIG_TIMESTAMP:
+        case EXTSIG_DECRYPT:
+        case EXTSIG_SCRYPT_KEY:
+        case EXTSIG_SCRYPT_DATA:
+        case EXTSIG_IBM_UNCOMPRESS:
+        case EXTSIG_IBM_COMPRESS:
+        case EXTSIG_POSZIP:
+        default:
+      }
+    }
+  }
+
+  return cdir;
 }
 
 function resizableBuffer() {
@@ -173,11 +302,6 @@ function resizableBuffer() {
   }
 }
 
-// helper function to initialize buffer of size
-function get_buf(size) {
-  return new Uint8Array(size);
-}
-
 exports.eocd = async ({ zipFile = '' }) => {
   let sb = toRandomAccessBuffer(zipFile);
   let rb = resizableBuffer();
@@ -185,7 +309,7 @@ exports.eocd = async ({ zipFile = '' }) => {
   let eocd = null;
 
   let isFound = false;
-  let buf_64 = get_buf(64);
+  let buf_64 = getbuf(64);
   let offset = 0;
   let isZip64 = false;
   while (!isFound && offset < SZ_MB_4) {
@@ -294,7 +418,7 @@ exports.eocd = async ({ zipFile = '' }) => {
   const cdStartOff = eocd.off_disk_cd;
   const cdEndOff = eocd.off_disk_cd + eocd.sz_cd;
   offset = cdEndOff;
-  let buf_2mb = get_buf(SZ_MB_2);
+  let buf_2mb = getbuf(SZ_MB_2);
   while (offset > cdStartOff) {
     let bytesLeft = offset - cdStartOff;
     let readsz = Math.min(bytesLeft, buf_2mb.byteLength);
@@ -339,6 +463,7 @@ exports.eocd = async ({ zipFile = '' }) => {
     throw new Error(`Expected ${expected} CDIR records, got ${actual}`);
   }
 
+  sb.close();
   return {
     eocd,
     cdirList
