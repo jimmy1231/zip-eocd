@@ -6,15 +6,19 @@
 
 const fs = require("fs");
 const path = require("path");
+const zlib = require("zlib");
+const CRC32 = require("crc-32");
 
 
 ///////////////////////////////////////
 const SZ_MB_4               = 4 * 1024 * 1024;
 const SZ_MB_2               = 2 * 1024 * 1024;
+const SZ_LOC_MAX            = 1024;
 
 const SIG_EOCD_64           = 0x06064b50;
 const SIG_EOCD              = 0x06054b50;
 const SIG_CDIR              = 0x02014b50;
+const SIG_LOC               = 0x04034b50;
 
 const EXTSIG_ZIP64          = 0x0001;
 const EXTSIG_AV             = 0x0007;
@@ -38,6 +42,27 @@ const EXTSIG_SCRYPT_DATA    = 0x0023;
 const EXTSIG_IBM_UNCOMPRESS = 0x0065;
 const EXTSIG_IBM_COMPRESS   = 0x0066;
 const EXTSIG_POSZIP         = 0x4690;
+
+const C_DEFLATE           = 8;
+const C_STORE             = 0;
+const C_SHRUNK            = 1;
+const C_REDUCED_CFACTOR_1 = 2;
+const C_REDUCED_CFACTOR_2 = 3;
+const C_REDUCED_CFACTOR_3 = 4;
+const C_REDUCED_CFACTOR_4 = 5;
+const C_IMPLODED          = 6;
+const C_DEFLATE_64        = 9;
+const C_BZIP2             = 12;
+const C_LZMA              = 14;
+const C_IBM_TERSE         = 18;
+const C_IBM_LZ77_z        = 19;
+const C_ZSTD              = 93;
+const C_MP3               = 94;
+const C_XZ                = 95;
+const C_JPEG              = 96;
+const C_WAVPACK           = 97;
+const C_PPMD_v1           = 98;
+const C_AE_X              = 99;
 
 
 const lget16 = (buf, off) => buf[off] | (buf[off+1] << 8);
@@ -87,6 +112,13 @@ function arraycopy(src, srcPos, dest, destPos, len) {
   }
 }
 
+function assert_crc32(buf, expected_crc32) {
+  let crc32 = CRC32.buf(buf);
+  if (crc32 !== expected_crc32) {
+    throw new Error(`CRC-32: Checksum mismatch. Expected: ${expected_crc32}, Actual: ${crc32}`);
+  }
+}
+
 function uint8arr_to_str(uint8Arr) {
   return Buffer.from(uint8Arr).toString('utf-8');
 }
@@ -114,6 +146,11 @@ function randomAccessFile(filepath) {
 
   return {
     head: (buf, off, len) => {
+      off = Number(off);
+      if (!Number.isSafeInteger(off)) {
+        throw new Error('offset is too big!');
+      }
+
       try {
         if (off > filesize || off < 0 || len < 0) {
           return -1;
@@ -143,6 +180,95 @@ function randomAccessFile(filepath) {
       fs.closeSync(fd);
     }
   }
+}
+
+function ZIP64_ext(buf, off, ext_len) {
+  let zip64_ext = {};
+
+  let id_hdr, sz_data;
+  let _ext_off = off;
+  const lim = off + ext_len;
+  while (_ext_off < lim) {
+    id_hdr = lget16(buf, _ext_off);
+    sz_data = lget16(buf, _ext_off+2);
+
+    switch (id_hdr) {
+      case EXTSIG_ZIP64:
+        if (sz_data === 24 || sz_data === 28) {
+          zip64_ext = {
+            ...zip64_ext,
+
+            sz_uncompress:  lget64_bint(buf, _ext_off+4),
+            sz_compress:    lget64_bint(buf, _ext_off+12),
+            off_loc:        lget64_bint(buf, _ext_off+20),
+          };
+
+          if (sz_data === 28) {
+            zip64_ext.num_disk = lget64_bint(buf, off+28);
+          }
+        }
+        break;
+
+      case EXTSIG_AV:
+      case EXTSIG_PFS:
+      case EXTSIG_OS2:
+      case EXTSIG_NTFS:
+      case EXTSIG_OPENVMS:
+      case EXTSIG_UNIX:
+      case EXTSIG_STREAM:
+      case EXTSIG_PATCH:
+      case EXTSIG_X509_PKCS:
+      case EXTSIG_X509_LOC:
+      case EXTSIG_X509_CEN:
+      case EXTSIG_CRYPT:
+      case EXTSIG_RMC:
+      case EXTSIG_CERT_LIST_PKCS:
+      case EXTSIG_TIMESTAMP:
+      case EXTSIG_DECRYPT:
+      case EXTSIG_SCRYPT_KEY:
+      case EXTSIG_SCRYPT_DATA:
+      case EXTSIG_IBM_UNCOMPRESS:
+      case EXTSIG_IBM_COMPRESS:
+      case EXTSIG_POSZIP:
+      default:
+    }
+
+    _ext_off += (4 + sz_data);
+  }
+
+  return zip64_ext;
+}
+
+function LOC(buf, off) {
+  let loc = {
+    sig:            lget32(buf, off),
+    ver:            lget16(buf, off+4),
+    flg_gen:        lget16(buf, off+6),
+    compression:    lget16(buf, off+8),
+    tm_last_mod:    lget16(buf, off+10),
+    dt_last_mod:    lget16(buf, off+12),
+    crc_32:         lget32(buf, off+14),
+    sz_compress:    lget32_bint(buf, off+18),
+    sz_uncompress:  lget32_bint(buf, off+22),
+    len_filename:   lget16(buf, off+26),
+    len_ext:        lget16(buf, off+28),
+
+    // set below
+    filename: '',
+    sz_loc: 0
+  };
+
+  loc.filename = cp_buf_str(buf, off+30, loc.len_filename);
+  loc.sz_loc = 30 + loc.len_filename + loc.len_ext;
+
+  if (loc.len_ext > 0) {
+    loc = {
+      ...loc,
+      ...ZIP64_ext(buf, off+46+loc.len_filename, loc.len_ext + 4)
+    };
+  }
+
+  return loc;
 }
 
 function EOCD(buf, off) {
@@ -213,12 +339,12 @@ function CDIR(buf, off) {
     compression:    lget16(buf, off+10),
     tm_last_mod:    lget16(buf, off+12),
     dt_last_mod:    lget16(buf, off+14),
-    crc_32:         lget32_bint(buf, off+16),
+    crc_32:         lget32(buf, off+16),
     sz_compress:    lget32_bint(buf, off+20),
     sz_uncompress:  lget32_bint(buf, off+24),
     len_filename:   lget16(buf, off+28),
     len_ext:        lget16(buf, off+30),
-    len_comment:    lget16(buf, off+34),
+    len_comment:    lget16(buf, off+32),
     num_disk:       lget16(buf, off+34),
     attrs_int:      lget16(buf, off+36),
     attrs_ext:      lget32_bint(buf, off+38),
@@ -235,56 +361,10 @@ function CDIR(buf, off) {
   cdir.sz_cdir = 46 + cdir.len_filename + cdir.len_ext + cdir.len_comment
 
   if (cdir.len_ext > 0) {
-    let ext_off = off+46+cdir.len_filename;
-    let ext_len = cdir.len_ext + 4;
-
-    let id_hdr, sz_data;
-    let _ext_off = ext_off;
-    const lim = ext_off + ext_len;
-    while (_ext_off < lim) {
-      id_hdr = lget16(buf, _ext_off);
-      sz_data = lget16(buf, _ext_off+2);
-
-      switch (id_hdr) {
-        case EXTSIG_ZIP64:
-          if (sz_data === 24 || sz_data === 28) {
-            cdir = {
-              ...cdir,
-
-              sz_uncompress:  lget64_bint(buf, _ext_off+4),
-              sz_compress:    lget64_bint(buf, _ext_off+12),
-              off_loc:        lget64_bint(buf, _ext_off+20),
-              num_disk:       sz_data === 28 ? lget64_bint(buf, off+28) : cdir.num_disk
-            };
-          }
-          break;
-
-        case EXTSIG_AV:
-        case EXTSIG_PFS:
-        case EXTSIG_OS2:
-        case EXTSIG_NTFS:
-        case EXTSIG_OPENVMS:
-        case EXTSIG_UNIX:
-        case EXTSIG_STREAM:
-        case EXTSIG_PATCH:
-        case EXTSIG_X509_PKCS:
-        case EXTSIG_X509_LOC:
-        case EXTSIG_X509_CEN:
-        case EXTSIG_CRYPT:
-        case EXTSIG_RMC:
-        case EXTSIG_CERT_LIST_PKCS:
-        case EXTSIG_TIMESTAMP:
-        case EXTSIG_DECRYPT:
-        case EXTSIG_SCRYPT_KEY:
-        case EXTSIG_SCRYPT_DATA:
-        case EXTSIG_IBM_UNCOMPRESS:
-        case EXTSIG_IBM_COMPRESS:
-        case EXTSIG_POSZIP:
-        default:
-      }
-
-      _ext_off += (4 + sz_data);
-    }
+    cdir = {
+      ...cdir,
+      ...ZIP64_ext(buf, off+46+cdir.len_filename, cdir.len_ext + 4)
+    };
   }
 
   return cdir;
@@ -335,6 +415,111 @@ function resizableBuffer() {
   }
 }
 
+function readentry(sb, cdir) {
+  /*
+   * 1) Read Local Header + Data
+   * 2) Parse Local Header
+   * 3) Isolate Data section of ZIP entry
+   * 4) Extract ZIP entry - depends on compression algorithm
+   *      - STORE: return data section
+   *      - DEFLATE: use zlib
+   *      - ...other: <not supported>
+   */
+
+  // 1)
+  let buf_entry = getbuf(SZ_LOC_MAX + num32b(cdir.sz_compress));
+  let len = sb.head(buf_entry, cdir.off_loc, buf_entry.byteLength);
+  if (len === -1) {
+    throw new Error('Could not read entry');
+  }
+
+  // 2)
+  let loc = LOC(buf_entry, 0);
+  if (loc.sig !== SIG_LOC) {
+    throw new Error('invalid local header signature');
+  }
+
+  // 3)
+  let buf_data = buf_entry.subarray(
+    loc.sz_loc,
+    loc.sz_loc + num32b(loc.sz_compress));
+
+  // 4)
+  switch (cdir.compression) {
+    case C_STORE:
+    {
+      assert_crc32(buf_data, loc.crc_32);
+      return buf_data;
+    }
+
+    case C_DEFLATE:
+    {
+      let buf_inflate = zlib.inflateRawSync(buf_data);
+      assert_crc32(buf_inflate, loc.crc_32);
+      return buf_inflate;
+    }
+
+    case C_SHRUNK:
+    case C_REDUCED_CFACTOR_1:
+    case C_REDUCED_CFACTOR_2:
+    case C_REDUCED_CFACTOR_3:
+    case C_REDUCED_CFACTOR_4:
+    case C_IMPLODED:
+    case C_DEFLATE_64:
+    case C_BZIP2:
+    case C_LZMA:
+    case C_IBM_TERSE:
+    case C_IBM_LZ77_z:
+    case C_ZSTD:
+    case C_MP3:
+    case C_XZ:
+    case C_JPEG:
+    case C_WAVPACK:
+    case C_PPMD_v1:
+    case C_AE_X:
+    default:
+      throw new Error('Invalid compression method');
+  }
+}
+
+/**
+ * @returns Returns the following object:
+ *  {
+ *    eocd: {
+ *      sig,
+ *      num_disk,
+ *      num_disk_cd,
+ *      num_disk_entries_cd,
+ *      num_entries_cd,
+ *      sz_cd,
+ *      off_disk_cd,
+ *      len_comment,
+ *      comment,
+ *    },
+ *    cdirList: [{
+ *      sig,
+ *      ver,
+ *      ver_ext,
+ *      flg_gen,
+ *      compression,
+ *      tm_last_mod,
+ *      dt_last_mod,
+ *      crc_32,
+ *      sz_compress,
+ *      sz_uncompress,
+ *      len_filename,
+ *      len_ext,
+ *      len_comment,
+ *      num_disk,
+ *      attrs_int,
+ *      attrs_ext,
+ *      off_loc,
+ *      sz_cdir,
+ *      filename,
+ *      comment
+ *    }]
+ *  }
+ */
 exports.zipEOCD = (zipFile = '') => {
   let sb = randomAccessFile(zipFile);
   let rb = resizableBuffer();
@@ -431,10 +616,6 @@ exports.zipEOCD = (zipFile = '') => {
     throw new Error("EOCD Not Found");
   }
 
-  if (eocd.num_disk !== 0n || eocd.num_disk_cd !== 0n) {
-    throw new Error("Multiple disks");
-  }
-
   let cdirList = [];
   /*
    * Read all Central Directory Headers (ZIP/64)
@@ -492,15 +673,18 @@ exports.zipEOCD = (zipFile = '') => {
   }
 
   // final sanity check
-  let expected = eocd.num_entries_cd;
+  let expected = bint(eocd.num_entries_cd);
   let actual = bint(cdirList.length);
   if (expected !== actual) {
     throw new Error(`Expected ${expected} CDIR records, got ${actual}`);
   }
 
-  sb.close();
   return {
     eocd,
-    cdirList
+    cdirList,
+    unzip: (cdir) => readentry(sb, cdir),
+    close: () => {
+      sb.close();
+    }
   };
 };
