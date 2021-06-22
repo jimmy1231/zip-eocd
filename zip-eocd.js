@@ -20,6 +20,9 @@ const SIG_EOCD              = 0x06054b50;
 const SIG_CDIR              = 0x02014b50;
 const SIG_LOC               = 0x04034b50;
 
+const V_32BIT_MAX_BINT      = 0xffffffffn;
+const V_16BIT_MAX           = 0xffff;
+
 const EXTSIG_ZIP64          = 0x0001;
 const EXTSIG_AV             = 0x0007;
 const EXTSIG_PFS            = 0x0008;
@@ -182,32 +185,52 @@ function randomAccessFile(filepath) {
   }
 }
 
-function ZIP64_ext(buf, off, ext_len) {
+function ZIP64_ext(cdir, buf, off, ext_len) {
   let zip64_ext = {};
 
   let id_hdr, sz_data;
-  let _ext_off = off;
   const lim = off + ext_len;
-  while (_ext_off < lim) {
-    id_hdr = lget16(buf, _ext_off);
-    sz_data = lget16(buf, _ext_off+2);
+  while (off < lim) {
+    id_hdr = lget16(buf, off);
+    sz_data = lget16(buf, off+2);
+
+    // skip over header
+    off += 4;
 
     switch (id_hdr) {
       case EXTSIG_ZIP64:
-        if (sz_data === 24 || sz_data === 28) {
-          zip64_ext = {
-            ...zip64_ext,
-
-            sz_uncompress:  lget64_bint(buf, _ext_off+4),
-            sz_compress:    lget64_bint(buf, _ext_off+12),
-            off_loc:        lget64_bint(buf, _ext_off+20),
-          };
-
-          if (sz_data === 28) {
-            zip64_ext.num_disk = lget64_bint(buf, off+28);
-          }
+      {
+        /*
+         * From ZIP specification:
+         * ------------------------------------------------------
+         * Fields MUST only appear if the corresponding Local (LOC)
+         * or Central Directory (CDIR) record field is set to:
+         *    - 0xFFFF (for 2-byte/16-bit fields)
+         *    - 0xFFFFFFFF (for 4-byte/32-bit fields)
+         */
+        let _off = off;
+        if (cdir.sz_uncompress === V_32BIT_MAX_BINT) {
+          zip64_ext.sz_uncompress = lget64_bint(buf, _off);
+          _off += 8;
         }
+
+        if (cdir.sz_compress === V_32BIT_MAX_BINT) {
+          zip64_ext.sz_compress = lget64_bint(buf, _off);
+          _off += 8;
+        }
+
+        if (cdir.off_loc === V_32BIT_MAX_BINT) {
+          zip64_ext.off_loc = lget64_bint(buf, _off);
+          _off += 8;
+        }
+
+        if (cdir.num_disk === V_16BIT_MAX) {
+          zip64_ext.num_disk = lget32(buf, _off);
+          _off += 8;
+        }
+
         break;
+      }
 
       case EXTSIG_AV:
       case EXTSIG_PFS:
@@ -233,7 +256,7 @@ function ZIP64_ext(buf, off, ext_len) {
       default:
     }
 
-    _ext_off += (4 + sz_data);
+    off += sz_data;
   }
 
   return zip64_ext;
@@ -363,7 +386,7 @@ function CDIR(buf, off) {
   if (cdir.len_ext > 0) {
     cdir = {
       ...cdir,
-      ...ZIP64_ext(buf, off+46+cdir.len_filename, cdir.len_ext + 4)
+      ...ZIP64_ext(cdir, buf, off+46+cdir.len_filename, cdir.len_ext + 4)
     };
   }
 
