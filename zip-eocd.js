@@ -146,7 +146,7 @@ function randomAccessFile(filepath) {
 
   return {
     head: (buf, off, len) => {
-      off = Number(off);
+      off = num32b(off);
       if (!Number.isSafeInteger(off)) {
         throw new Error('offset is too big!');
       }
@@ -683,8 +683,6 @@ exports.zipEOCD = (zipFile = '') => {
     eocd,
     cdirList,
     unzip: (cdir) => readentry(sb, cdir),
-    close: () => {
-      sb.close();
-    }
+    close: () => sb.close()
   };
 };
