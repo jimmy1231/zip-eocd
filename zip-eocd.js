@@ -185,7 +185,7 @@ function randomAccessFile(filepath) {
   }
 }
 
-function ZIP64_ext(cdir, buf, off, ext_len) {
+function ZIP64_ext(record, buf, off, ext_len) {
   let zip64_ext = {};
 
   let id_hdr, sz_data;
@@ -203,28 +203,35 @@ function ZIP64_ext(cdir, buf, off, ext_len) {
         /*
          * From ZIP specification:
          * ------------------------------------------------------
-         * Fields MUST only appear if the corresponding Local (LOC)
-         * or Central Directory (CDIR) record field is set to:
-         *    - 0xFFFF (for 2-byte/16-bit fields)
+         * If one of the size or offset fields in the Local (LOC)
+         * or Central Directory (CDIR) record is too small to hold
+         * the required data, a Zip64 extended information record
+         * is created.
+         *
+         * The order of the fields in the zip64 extended iformation
+         * record is fixed, but the fields MUST only appear if the
+         * corresponding Local (LOC) or Central Directory (CDIR)
+         * record field is set to:
+         *    - 0xFFFF (for 2-byte/16-bit fields), or
          *    - 0xFFFFFFFF (for 4-byte/32-bit fields)
          */
         let _off = off;
-        if (cdir.sz_uncompress === V_32BIT_MAX_BINT) {
+        if (record.sz_uncompress === V_32BIT_MAX_BINT) {
           zip64_ext.sz_uncompress = lget64_bint(buf, _off);
           _off += 8;
         }
 
-        if (cdir.sz_compress === V_32BIT_MAX_BINT) {
+        if (record.sz_compress === V_32BIT_MAX_BINT) {
           zip64_ext.sz_compress = lget64_bint(buf, _off);
           _off += 8;
         }
 
-        if (cdir.off_loc === V_32BIT_MAX_BINT) {
+        if (record.off_loc === V_32BIT_MAX_BINT) {
           zip64_ext.off_loc = lget64_bint(buf, _off);
           _off += 8;
         }
 
-        if (cdir.num_disk === V_16BIT_MAX) {
+        if (record.num_disk === V_16BIT_MAX) {
           zip64_ext.num_disk = lget32(buf, _off);
           _off += 8;
         }
@@ -287,7 +294,7 @@ function LOC(buf, off) {
   if (loc.len_ext > 0) {
     loc = {
       ...loc,
-      ...ZIP64_ext(buf, off+46+loc.len_filename, loc.len_ext + 4)
+      ...ZIP64_ext(loc, buf, off+46+loc.len_filename, loc.len_ext + 4)
     };
   }
 
