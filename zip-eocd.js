@@ -294,7 +294,7 @@ function LOC(buf, off) {
   if (loc.len_ext > 0) {
     loc = {
       ...loc,
-      ...ZIP64_ext(loc, buf, off+46+loc.len_filename, loc.len_ext + 4)
+      ...ZIP64_ext(loc, buf, off+30+loc.len_filename, loc.len_ext)
     };
   }
 
@@ -393,7 +393,7 @@ function CDIR(buf, off) {
   if (cdir.len_ext > 0) {
     cdir = {
       ...cdir,
-      ...ZIP64_ext(cdir, buf, off+46+cdir.len_filename, cdir.len_ext + 4)
+      ...ZIP64_ext(cdir, buf, off+46+cdir.len_filename, cdir.len_ext)
     };
   }
 
