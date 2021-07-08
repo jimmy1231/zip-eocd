@@ -13,12 +13,14 @@ const CRC32 = require("crc-32");
 ///////////////////////////////////////
 const SZ_MB_4               = 4 * 1024 * 1024;
 const SZ_MB_2               = 2 * 1024 * 1024;
+const SZ_DESC_MAX           = 4 * 4;
 const SZ_LOC_MAX            = 1024;
 
 const SIG_EOCD_64           = 0x06064b50;
 const SIG_EOCD              = 0x06054b50;
 const SIG_CDIR              = 0x02014b50;
 const SIG_LOC               = 0x04034b50;
+const SIG_DESC              = 0x08074b50;
 
 const V_32BIT_MAX_BINT      = 0xffffffffn;
 const V_16BIT_MAX           = 0xffff;
@@ -74,6 +76,8 @@ const lget32 = (buf, off) => (lget16(buf, off) | (lget16(buf, off+2) << 16)) & 0
 const lget16_bint = (buf, off) => BigInt(buf[off]) | (BigInt(buf[off+1]) << 8n);
 const lget32_bint = (buf, off) => (lget16_bint(buf, off) | (lget16_bint(buf, off+2) << 16n)) & 0xffffffffn;
 const lget64_bint = (buf, off) => lget32_bint(buf, off) | (lget32_bint(buf, off+4) << 32n);
+const mask_and_shift = (num, mask, shift) => (num & mask) >> shift;
+const getbit = (num, bitnum) => (num >> bitnum) & 0x1;
 const num32b = (bigint) => Number(bigint);
 const bint = (num) => BigInt(num);
 const BInt_max = (...entries) => {
@@ -301,6 +305,15 @@ function LOC(buf, off) {
   return loc;
 }
 
+function DESC(buf, off) {
+  return {
+    sig:            lget32(buf, off),
+    crc_32:         lget32(buf, off+4),
+    sz_compress:    lget32_bint(buf, off+8),
+    sz_uncompress:  lget32_bint(buf, off+12)
+  };
+}
+
 function EOCD(buf, off) {
   let eocd = {
     sig:                  lget32(buf, off),
@@ -400,8 +413,10 @@ function CDIR(buf, off) {
   return cdir;
 }
 
-function resizableBuffer() {
-  let buf = new Uint8Array(0);
+function resizableBuffer(buf) {
+  if (!buf) {
+    buf = new Uint8Array(0);
+  }
 
   const resize = (newLen, origOff, newOff, len) => {
     let tmp = new Uint8Array(newLen);
@@ -445,6 +460,31 @@ function resizableBuffer() {
   }
 }
 
+function getdesc(sb, cdir, data_off) {
+  let off = data_off + cdir.sz_compress;
+  let rb = resizableBuffer(getbuf(SZ_DESC_MAX));
+  let len = sb.head(rb.getBuffer(), off, rb.getBuffer().byteLength);
+  if (len === -1) {
+    throw new Error("EOF");
+  }
+
+  // check DESC signature
+  let bit32 = rb.lget32(0);
+  if (bit32 !== SIG_DESC) {
+    throw new Error("Invalid data descriptor signature");
+  }
+
+  let desc = DESC(rb.getBuffer(), 0);
+
+  // sanity check
+  if (cdir.sz_compress !== desc.sz_compress
+    || cdir.sz_uncompress !== desc.sz_uncompress) {
+    throw new Error("Data descriptor mismatch with CDIR");
+  }
+
+  return desc;
+}
+
 function readentry(sb, cdir) {
   /*
    * 1) Read Local Header + Data
@@ -484,8 +524,30 @@ function readentry(sb, cdir) {
 
     case C_DEFLATE:
     {
+      let crc_32 = loc.crc_32;
+      let sz_uncompress = loc.sz_uncompress;
+
+      // check for data descriptor
+      if (buf_data.length === 0
+        && getbit(loc.flg_gen, 3) === 1
+        && loc.sz_compress === 0n
+        && loc.sz_uncompress === 0n
+        && crc_32 === 0) {
+        let desc = getdesc(sb, cdir,
+          // offset to file data
+          cdir.off_loc+bint(loc.sz_loc)
+        );
+
+        buf_data = buf_entry.subarray(
+          loc.sz_loc,
+          loc.sz_loc + num32b(desc.sz_compress));
+
+        crc_32 = desc.crc_32;
+        sz_uncompress = desc.sz_uncompress;
+      }
+
       let buf_inflate = zlib.inflateRawSync(buf_data);
-      assert_crc32(buf_inflate, loc.crc_32);
+      assert_crc32(buf_inflate, crc_32);
       return buf_inflate;
     }
 
